@@ -13,7 +13,7 @@ import storage
 
 STATES = [
     "new", "searching", "not_found", "found", "indirect_exposure", "action_selected", "submitted",
-    "verification_pending", "awaiting_processing", "confirmed_removed", "reappeared",
+    "form_required", "verification_pending", "awaiting_processing", "confirmed_removed", "reappeared",
     "human_task_queued", "blocked",
 ]
 
@@ -31,17 +31,25 @@ TRANSITIONS: dict[str, set[str]] = {
     # direct listing (-> found).
     "indirect_exposure": {"submitted", "human_task_queued", "not_found", "found", "blocked"},
     "action_selected": {"submitted", "human_task_queued", "blocked"},
-    "submitted": {"verification_pending", "awaiting_processing", "human_task_queued", "blocked"},
+    "submitted": {"verification_pending", "awaiting_processing", "form_required",
+                  "human_task_queued", "blocked"},
+    # form_required: the broker's reply didn't confirm the request -- it demanded a web form
+    # (suppression center / iframe widget / support ticket / PDF) instead. -> submitted once the
+    # form is filled and the request re-lodged; -> human_task_queued when a required field is
+    # missing from the dossier or the reply carries a hard gate (captcha/gov-ID/account creation)
+    # the agent can't clear itself; -> blocked when the form portal itself is unreachable/broken.
+    "form_required": {"submitted", "human_task_queued", "blocked"},
     # verification_pending -> awaiting_processing: the verify link was opened/acknowledged and the
     # broker is now processing the removal (their stated window). confirmed_removed still requires a
     # verifying re-scan, never the submission flow's own say-so.
-    "verification_pending": {"awaiting_processing", "confirmed_removed", "human_task_queued", "blocked"},
+    "verification_pending": {"awaiting_processing", "confirmed_removed", "form_required",
+                             "human_task_queued", "blocked"},
     "awaiting_processing": {"confirmed_removed", "human_task_queued", "blocked"},
     "confirmed_removed": {"reappeared", "confirmed_removed"},
     "reappeared": {"found", "indirect_exposure"},
     "human_task_queued": {
-        "found", "indirect_exposure", "action_selected", "submitted", "verification_pending",
-        "awaiting_processing", "confirmed_removed", "blocked",
+        "found", "indirect_exposure", "action_selected", "submitted", "form_required",
+        "verification_pending", "awaiting_processing", "confirmed_removed", "blocked",
     },
     # blocked: automated tools (web_extract/proxyless browser) couldn't read the site. A later pass
     # -- a stealth/cloud browser OR guiding the operator's own (residential) browser -- can resolve it
@@ -49,7 +57,7 @@ TRANSITIONS: dict[str, set[str]] = {
     # blocked -> human_task_queued: some blocked sites need an operator step to proceed at all
     # (face-recognition sites needing a selfie/gov-ID, etc.), so route them to the digest.
     "blocked": {"searching", "found", "not_found", "indirect_exposure", "action_selected",
-                "human_task_queued"},
+                "human_task_queued", "form_required"},
 }
 
 

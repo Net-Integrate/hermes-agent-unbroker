@@ -42,6 +42,7 @@ import crypto           # noqa: E402
 import dossier          # noqa: E402
 import email_modes      # noqa: E402
 import emailer          # noqa: E402
+import form_reply       # noqa: E402
 import pdd              # noqa: E402
 import legal            # noqa: E402
 import ledger           # noqa: E402
@@ -613,6 +614,137 @@ def test_extract_verification_link_prefers_broker_optout_link():
 
 def test_extract_verification_link_ignores_unrelated_only():
     assert email_modes.extract_verification_link("see https://example.com/news today") is None
+
+
+# --- form-completion lane (classify_reply / form_required) --------------------
+
+_FORM_REPLY = (
+    "Thank you for contacting Spokeo. We do not process opt-out requests received by email.\n"
+    "Please complete the form at https://www.spokeo.com/optout/manage to remove your listing.\n"
+    "The form requires your full name, email address, and city, and asks you to check the box "
+    "to confirm your request. Please submit within 10 days.\n"
+)
+
+
+def test_classify_reply_detects_form_and_extracts_fields():
+    c = form_reply.classify_reply(_FORM_REPLY, brokers.get("spokeo"))
+    assert c["form_required"] is True
+    assert c["form_url"] and "spokeo.com" in c["form_url"]
+    assert c["required_fields"] == ["city", "contact_email", "full_name"]
+    assert c["hidden_gates"] == ["checkbox_consent"]
+    assert c["due_date"] == "10 days"
+
+
+def test_classify_reply_plain_confirmation_is_not_a_form():
+    body = "Click https://www.spokeo.com/optout/confirm?token=abc to confirm your request."
+    c = form_reply.classify_reply(body, brokers.get("spokeo"))
+    assert c["form_required"] is False
+    assert c["required_fields"] == []
+
+
+def test_missing_fields_flags_what_the_dossier_cannot_answer():
+    d = _consenting()
+    # date_of_birth IS on file, but a made-up field the dossier never carries is not.
+    assert form_reply.missing_fields(d, ["full_name", "date_of_birth"]) == []
+    assert form_reply.missing_fields(d, ["full_name", "passport_number"]) == ["passport_number"]
+
+
+def test_blocking_gates_separates_hard_from_soft():
+    assert form_reply.blocking_gates(["checkbox_consent", "captcha"]) == ["captcha"]
+    assert form_reply.blocking_gates(["email_verification"]) == []
+    assert form_reply.blocking_gates(["account_verification", "id_verification"]) == \
+        ["account_verification", "id_verification"]
+
+
+def test_classify_reply_cmd_transitions_case_to_form_required():
+    with temp_env():
+        sid = _run(["intake", "--full-name", "Jane Q. Public", "--email", "jane@example.com",
+                   "--city", "Oakland", "--state", "CA", "--consent"])["subject_id"]
+        ledger.transition(sid, "spokeo", "found", found=True)
+        ledger.transition(sid, "spokeo", "submitted")
+        out = _run(["classify-reply", sid, "spokeo", "--text", _FORM_REPLY])
+        assert out["state"] == "form_required"
+        assert out["task"]["form_url"] and "spokeo.com" in out["task"]["form_url"]
+        assert out["missing_fields"] == []
+        assert out["blocking_gates"] == []
+        case = ledger.get_case(sid, "spokeo")
+        assert case["state"] == "form_required"
+        assert case["evidence"]["form_task"]["required_fields"] == ["city", "contact_email", "full_name"]
+
+
+def test_classify_reply_cmd_flags_missing_field_as_human_task():
+    with temp_env():
+        # no --city/--state on file: the reply's "city" requirement can't be answered
+        sid = _run(["intake", "--full-name", "Jane Q. Public", "--email", "jane@example.com",
+                   "--consent"])["subject_id"]
+        ledger.transition(sid, "spokeo", "found", found=True)
+        ledger.transition(sid, "spokeo", "submitted")
+        out = _run(["classify-reply", sid, "spokeo", "--text", _FORM_REPLY])
+        assert out["missing_fields"] == ["city"]
+        assert "human_task_queued" in out["next"]
+
+
+def test_ledger_form_required_transitions():
+    with temp_env():
+        sid = "sub_test01"
+        ledger.transition(sid, "spokeo", "found", found=True)
+        ledger.transition(sid, "spokeo", "submitted")
+        case = ledger.transition(sid, "spokeo", "form_required", evidence={"form_task": {"required_fields": []}})
+        assert case["state"] == "form_required"
+        # completing the form re-lodges the request
+        assert ledger.transition(sid, "spokeo", "submitted")["state"] == "submitted"
+        # missing data / hard gates queue a human task instead of guessing
+        ledger.transition(sid, "spokeo", "form_required")
+        assert ledger.transition(sid, "spokeo", "human_task_queued")["state"] == "human_task_queued"
+        # form_required -> not_found is illegal (there is no scan-verdict lever from here)
+        ledger.transition(sid, "spokeo", "submitted")
+        ledger.transition(sid, "spokeo", "form_required")
+        try:
+            ledger.transition(sid, "spokeo", "not_found")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("form_required -> not_found should be illegal")
+
+
+def test_next_actions_form_required_drives_form_when_fields_available():
+    with temp_env():
+        d = _consenting()
+        b = _mini_broker("formy")
+        led = {"formy": {"broker_id": "formy", "state": "form_required",
+                         "evidence": {"form_task": {"form_url": "https://formy.example/optout",
+                                                     "required_fields": ["full_name", "contact_email"],
+                                                     "hidden_gates": []}}}}
+        q = autopilot.next_actions(d, [b], _auto_cfg(), led, env={})
+        fills = [a for a in q["actions"] if a["type"] == "form_fill_web"]
+        assert fills and fills[0]["form_url"] == "https://formy.example/optout"
+        assert fills[0]["fields"] == ["full_name", "contact_email"]
+
+
+def test_next_actions_form_required_missing_field_goes_to_digest():
+    with temp_env():
+        d = _consenting()
+        b = _mini_broker("formy")
+        led = {"formy": {"broker_id": "formy", "state": "form_required",
+                         "evidence": {"form_task": {"form_url": "https://formy.example/optout",
+                                                     "required_fields": ["full_name", "passport_number"],
+                                                     "hidden_gates": []}}}}
+        q = autopilot.next_actions(d, [b], _auto_cfg(), led, env={})
+        assert not any(a["type"] == "form_fill_web" for a in q["actions"])
+        assert any("missing required field" in t["reason"] for t in q["human_digest"])
+
+
+def test_next_actions_form_required_hard_gate_goes_to_digest():
+    with temp_env():
+        d = _consenting()
+        b = _mini_broker("formy")
+        led = {"formy": {"broker_id": "formy", "state": "form_required",
+                         "evidence": {"form_task": {"form_url": "https://formy.example/optout",
+                                                     "required_fields": ["full_name"],
+                                                     "hidden_gates": ["captcha"]}}}}
+        q = autopilot.next_actions(d, [b], _auto_cfg(), led, env={})
+        assert not any(a["type"] == "form_fill_web" for a in q["actions"])
+        assert any("human-only gate" in t["reason"] for t in q["human_digest"])
 
 
 # --- BADBOOL live-pull parser -------------------------------------------------

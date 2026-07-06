@@ -38,6 +38,7 @@ import crypto                       # noqa: E402
 import dossier as dossier_mod      # noqa: E402
 import email_modes                 # noqa: E402
 import emailer                     # noqa: E402
+import form_reply                  # noqa: E402
 import ledger as ledger_mod        # noqa: E402
 import legal                       # noqa: E402
 import paths as paths_mod          # noqa: E402
@@ -641,6 +642,50 @@ def cmd_verify_link(args) -> None:
                    "no broker/opt-out-scoped link found in that text; confirm you opened the right email")})
 
 
+def cmd_classify_reply(args) -> None:
+    """Read a broker's reply and decide whether it demands a web form, not just a verify click.
+
+    Counterpart to `verify-link` for the reply shape `verify-link`/`poll-verification` don't
+    cover: "we don't process opt-outs by email; complete the form at <url>". If the reply's own
+    wording matches that pattern, extracts form_url/required_fields/hidden_gates/due_date,
+    transitions the case to `form_required` with the classification stored as evidence, and
+    flags any required field the dossier can't answer or any hard gate (captcha/gov-ID/account)
+    so the caller queues a human task instead of guessing.
+    """
+    d = _require_subject(args.subject)
+    b = brokers_mod.get(args.broker)
+    if not b:
+        sys.exit(f"error: unknown broker {args.broker!r}")
+    text = args.text
+    if args.file:
+        text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+    if not text:
+        sys.exit("error: provide --text '<email body>' (or --file) from the broker's reply")
+    classification = form_reply.classify_reply(text, b)
+    if not classification["form_required"]:
+        _out({"broker": args.broker, "form_required": False,
+              "note": "no form-completion request detected; treat as a normal reply (see "
+                      "`verify-link` / `poll-verification` for a plain confirmation link)"})
+        return
+    task = form_reply.build_task(args.subject, args.broker, classification)
+    missing = form_reply.missing_fields(d, task["required_fields"])
+    blocking = form_reply.blocking_gates(task["hidden_gates"])
+    case = ledger_mod.transition(args.subject, args.broker, "form_required", evidence={"form_task": task})
+    if missing:
+        next_step = (f"missing required field(s) {missing} in the dossier: "
+                     f"`record {args.subject} {args.broker} human_task_queued --reason "
+                     f"\"form needs {', '.join(missing)}\"`")
+    elif blocking:
+        next_step = (f"hard gate(s) {blocking} need an operator: "
+                     f"`record {args.subject} {args.broker} human_task_queued --reason "
+                     f"\"form requires {', '.join(blocking)}\"`")
+    else:
+        next_step = (f"open {task['form_url']} and submit only {task['required_fields']}, then "
+                     f"`record {args.subject} {args.broker} submitted --disclosed <fields> --channel web_form`")
+    _out({"broker": args.broker, "state": case["state"], "task": task,
+          "missing_fields": missing, "blocking_gates": blocking, "next": next_step})
+
+
 def cmd_poll_verification(args) -> None:
     """Poll the inbox for brokers' verification links (Mode B) - replaces the human click-chase.
 
@@ -863,6 +908,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--text", help="the confirmation email body (read from the operator's webmail)")
     s.add_argument("--file", help="path to a file with the email body (alternative to --text)")
     s.set_defaults(func=cmd_verify_link)
+
+    s = sub.add_parser("classify-reply",
+                       help="does a broker's reply demand a web form (not just a verify click)? "
+                            "extracts form_url/required_fields/hidden_gates and records form_required")
+    s.add_argument("subject")
+    s.add_argument("broker")
+    s.add_argument("--text", help="the broker's reply body (read from webmail or IMAP)")
+    s.add_argument("--file", help="path to a file with the reply body (alternative to --text)")
+    s.set_defaults(func=cmd_classify_reply)
 
     s = sub.add_parser("tasks", help="ONE consolidated human-task digest (present at end of run)")
     s.add_argument("subject")

@@ -12,6 +12,7 @@ STATE_LABELS = {
     "indirect_exposure": "Indirect exposure (PII on a relative's record)",
     "action_selected": "Action selected",
     "submitted": "Submitted",
+    "form_required": "Reply requires a web form",
     "verification_pending": "Awaiting verification",
     "awaiting_processing": "Processing",
     "confirmed_removed": "Removed",
@@ -39,7 +40,8 @@ def metrics(subject_id: str) -> dict:
     """
     c = status_counts(subject_id)
     removed = c.get("confirmed_removed", 0)
-    in_flight = c.get("submitted", 0) + c.get("verification_pending", 0) + c.get("awaiting_processing", 0)
+    in_flight = c.get("submitted", 0) + c.get("verification_pending", 0) + c.get("awaiting_processing", 0) \
+        + c.get("form_required", 0)
     open_found = c.get("found", 0) + c.get("reappeared", 0) + c.get("action_selected", 0) \
         + c.get("indirect_exposure", 0)
     acted = removed + in_flight + open_found + c.get("human_task_queued", 0) + c.get("blocked", 0)

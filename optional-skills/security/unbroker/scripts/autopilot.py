@@ -25,6 +25,7 @@ from pathlib import Path
 
 import brokers as brokers_mod
 import emailer
+import form_reply
 import ledger as ledger_mod
 import paths
 import registry
@@ -299,6 +300,48 @@ def next_actions(dossier: dict, brokers_list: list[dict], cfg: dict,
                     "verification email must be opened by a human (draft mode, no inbox access)",
                     ["Open the broker's verification email in the subject's inbox and click the link",
                      f"Then: python3 scripts/pdd.py record {subject_id} {bid} awaiting_processing"]))
+
+    # 2b) form_required cases: the broker's reply demanded a web form, not just a verify click.
+    # `classify-reply` already stored the extracted task (form_url/required_fields/hidden_gates) as
+    # evidence when it transitioned the case here. Missing dossier data or a hard gate (captcha /
+    # gov-ID / account creation) route to the digest instead of guessing; otherwise drive the form.
+    for bid, case in sorted(ledger.items()):
+        if case.get("state") != "form_required":
+            continue
+        broker = by_id.get(bid) or {}
+        broker_name = broker.get("name") or bid
+        task = ((case.get("evidence") or {}).get("form_task")) or {}
+        required = task.get("required_fields") or []
+        missing = form_reply.missing_fields(dossier, required)
+        blocking = form_reply.blocking_gates(task.get("hidden_gates") or [])
+        if missing:
+            digest.append(_digest(
+                {"broker_id": bid, "broker_name": broker_name},
+                f"broker's reply form is missing required field(s): {', '.join(missing)}",
+                [f"Supply {', '.join(missing)} (dossier is missing it) so the agent can complete the form",
+                 f"Then: python3 scripts/pdd.py record {subject_id} {bid} submitted "
+                 f"--disclosed {','.join(required)} --channel web_form"]))
+        elif blocking:
+            digest.append(_digest(
+                {"broker_id": bid, "broker_name": broker_name},
+                f"broker's reply form has a human-only gate: {', '.join(blocking)}",
+                [f"Open {task.get('form_url')} and complete the gated step yourself",
+                 f"Then: python3 scripts/pdd.py record {subject_id} {bid} submitted "
+                 f"--disclosed {','.join(required)} --channel web_form"]))
+        else:
+            actions.append({
+                "type": "form_fill_web",
+                "broker_id": bid, "broker_name": broker_name, "confirm_first": confirm_first,
+                "form_url": task.get("form_url"), "form_kind": task.get("form_kind"),
+                "fields": required, "hidden_gates": task.get("hidden_gates") or [],
+                "due_date": task.get("due_date"),
+                "steps": [f"browser_navigate {task.get('form_url')}",
+                          f"submit ONLY {required} (values from the dossier); check any consent "
+                          "checkbox, complete an email-verification step if prompted",
+                          "screenshot the confirmation into evidence/"],
+                "after": f"python3 scripts/pdd.py record {subject_id} {bid} submitted "
+                         f"--disclosed {','.join(required)} --channel web_form",
+            })
 
     # 3) due rechecks: processing windows elapsed / reappearance sweeps
     for case in ledger_mod.due(subject_id, at=at, ledger=ledger):

@@ -107,8 +107,8 @@ def fanout(brokers_list: list[dict], batch_size: int = 5) -> dict:
 
 # States that mean "the crawl reached a verdict for this broker".
 _SCANNED_STATES = {"found", "not_found", "indirect_exposure", "blocked", "submitted",
-                   "verification_pending", "awaiting_processing", "confirmed_removed", "reappeared",
-                   "action_selected", "human_task_queued"}
+                   "form_required", "verification_pending", "awaiting_processing",
+                   "confirmed_removed", "reappeared", "action_selected", "human_task_queued"}
 # States that still need a deletion action taken.
 _ACTIONABLE_STATES = {"found", "indirect_exposure", "reappeared", "action_selected"}
 
@@ -138,7 +138,7 @@ def batch_plan(subject_dossier: dict, brokers_list: list[dict], cfg: dict,
         "found": [],            # direct removable listing -> Phase 2 opt-out (incl. reappeared/action_selected)
         "indirect_exposure": [],# PII on a third party's record -> CCPA/GDPR delete email
         "blocked": [],          # anti-bot / needs stealth browser -> requeue
-        "in_progress": [],      # submitted / verification_pending / awaiting_processing
+        "in_progress": [],      # submitted / form_required / verification_pending / awaiting_processing
         "human": [],            # human_task_queued -> the end-of-run digest, NOT re-scanning
         "done": [],             # confirmed_removed
         "not_found": [],
@@ -151,7 +151,7 @@ def batch_plan(subject_dossier: dict, brokers_list: list[dict], cfg: dict,
         # cluster collapse: if a parent in this set is already actioned, the child is covered
         parent = child_to_parent.get(bid)
         if parent and state_of(parent) in ("found", "reappeared", "action_selected", "submitted",
-                                           "verification_pending", "awaiting_processing",
+                                           "form_required", "verification_pending", "awaiting_processing",
                                            "confirmed_removed", "human_task_queued"):
             covered_by_parent.setdefault(parent, []).append(bid)
             continue
@@ -165,7 +165,7 @@ def batch_plan(subject_dossier: dict, brokers_list: list[dict], cfg: dict,
                "deletion": a.get("deletion") or {},
                "optout_playbook": a.get("optout_playbook") or [],
                "notes": a.get("notes", "")}
-        if st in ("submitted", "verification_pending", "awaiting_processing"):
+        if st in ("submitted", "form_required", "verification_pending", "awaiting_processing"):
             groups["in_progress"].append(row)
         elif st == "confirmed_removed":
             groups["done"].append(row)

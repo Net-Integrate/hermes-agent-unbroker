@@ -222,6 +222,37 @@ Then follow the **Verification loop** if the broker emails a confirmation link.
 - Either way, the due queue (`pdd.py due`) brings the case back after the broker's processing window
   for the verifying re-scan; only that re-scan justifies `confirmed_removed`.
 
+## Form-completion lane (reply says "complete this form")
+
+Not every reply to a `submitted`/`verification_pending` email is a plain confirmation link. Some
+brokers reply "we do not process opt-out requests by email; complete the form at <url>" - a
+suppression center, an iframe-embedded widget, a support-ticket portal, or even a PDF. Treating
+that reply as the final step stalls the case, so it gets its own lane instead of being forced
+through the verification-link flow:
+
+1. **Classify the reply.** `pdd.py classify-reply <subject> <broker> --text '<reply body>'`
+   (`scripts/form_reply.py`, network-free) reads the wording for a form requirement and, if found,
+   extracts `form_url`, `required_fields`, `hidden_gates` (checkbox consent / captcha / account or
+   email verification / gov-ID), and any stated `due_date`. If it does not detect a form
+   requirement, treat the reply as a normal one (`verify-link`/`poll-verification`).
+2. **Record the task.** A detected form transitions the case to `form_required` with the
+   classification stored as `evidence.form_task` - the structured task record `next` reads on the
+   following runs so nobody has to re-parse the email.
+3. **Fill only verified data.** `next` (and `classify-reply` itself) diffs `required_fields`
+   against what `dossier.select_disclosure` can actually answer. A missing field stops the fill
+   and queues `human_task_queued` - never guess a value.
+4. **Hard gates stop automated submission.** `captcha`, `id_verification`, and
+   `account_verification` are queued as `human_task_queued` (mirrors the `T3` human-only routing
+   above); `checkbox_consent` and `email_verification` are cleared by the agent as part of driving
+   the form (consent was already recorded at intake; no extra disclosure).
+5. **Drive the form.** With no missing fields and no hard gate, `next` emits a `form_fill_web`
+   action: `browser_navigate` the `form_url`, submit only the listed fields, clear any consent
+   checkbox, screenshot the confirmation, then `record ... submitted --disclosed <fields> --channel
+   web_form`. This puts the case back on the normal **Verification loop** above if the broker then
+   requires a confirmation click.
+6. **Blocked ports.** If the form URL itself 404s or is anti-bot gated, `record ... blocked`
+   instead of guessing - same rule as any other broken opt-out mechanic.
+
 ## phone_callback (e.g. Whitepages)
 
 Submit the web form, then the site places an automated call with a numeric code. If the operator is

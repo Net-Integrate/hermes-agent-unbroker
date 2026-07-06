@@ -125,6 +125,7 @@ breaks reading the dossier).
 | `$PDD show <subject> <broker>` | Read back a case's recorded state + evidence + disclosure log (so the parent re-verifies a subagent's `found` without re-deriving the listing URL) |
 | `$PDD send-email <subject> <broker> --listing <url> [--kind ccpa_indirect ...]` | Render + record the request (recipient locked to the broker's own address). **browser** mode returns a `compose` payload to send via webmail (no password); **programmatic** mode SMTP-sends |
 | `$PDD verify-link <subject> <broker> --text '<body>'` | **browser mode**: extract a broker's verification link from webmail text you read (anti-phishing scored) |
+| `$PDD classify-reply <subject> <broker> --text '<body>'` | Does the broker's reply demand a **web form** instead of a plain verify click? Extracts `form_url`/`required_fields`/`hidden_gates`, records `form_required` |
 | `$PDD poll-verification <subject> [--broker <id>]` | **programmatic mode**: poll IMAP for verification links (anti-phishing scored); auto-advances `submitted → verification_pending` |
 | `$PDD render-email <subject> <broker> --listing <url>` | Draft only (fallback when no email mode is configured) |
 | `$PDD due <subject>` | Cases whose recheck window arrived (the cron re-scan queue) |
@@ -214,10 +215,11 @@ recording `found` and before any deletion.
    ```
 
    `next` emits, in order: `refresh_brokers` (stale cache), `fanout_scan`/`scan_inline` (Phase 1
-   crawl - see step 4), `poll_verification` (in-flight email confirmations), `verify_removal` (due
-   re-checks), `optout_web_form`/`optout_email_send` (Phase 2, parents-first with playbook steps),
-   `indirect_email_send`, and `stealth_rescan`. Human-only work never appears as an action - it
-   accumulates in `q.human_digest`. In `autonomy=full`, execute actions without pausing; honor
+   crawl - see step 4), `poll_verification` (in-flight email confirmations), `form_fill_web`
+   (a broker's reply demanded a web form, not just a verify click - see step 6), `verify_removal`
+   (due re-checks), `optout_web_form`/`optout_email_send` (Phase 2, parents-first with playbook
+   steps), `indirect_email_send`, and `stealth_rescan`. Human-only work never appears as an action -
+   it accumulates in `q.human_digest`. In `autonomy=full`, execute actions without pausing; honor
    `confirm_first` in `assisted` mode.
 4. **Scanning (when `next` says so).** For `fanout_scan`: run `$PDD fanout <subject>` and **spawn one
    `delegate_task` subagent per `batch`, in parallel, passing that batch's ready-made `brief`** - do
@@ -261,6 +263,12 @@ recording `found` and before any deletion.
     link in the same browser** (several brokers bind the verification session to the browser that
     opens it), finish the flow, then record `awaiting_processing`. `confirmed_removed` ONLY after a
     verifying re-scan shows the listing gone - never off the submission flow's own confirmation page.
+    **A reply is not automatically the final step**: if the broker's wording demands a form instead
+    of confirming, `$PDD classify-reply <subject> <broker> --text '<body>'` extracts the
+    `form_url`/`required_fields`/`hidden_gates` and records `form_required`. `next` then emits a
+    `form_fill_web` action once every required field is on file and no hard gate (captcha/gov-ID/
+    account) is present - otherwise it queues `human_task_queued` instead of guessing. See
+    `references/methods.md` -> "Form-completion lane".
 7. **Wrap up (once per run).** When `next` returns no actions: present `$PDD tasks <subject>` (the
    consolidated human digest) if non-empty, then `$PDD status <subject>`; if the Sheets tracker is
    on, append `$PDD report <subject> --sheets` rows via the `google-workspace` skill.
