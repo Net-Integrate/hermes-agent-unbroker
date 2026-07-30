@@ -1323,6 +1323,65 @@ class AIAgent:
             "See hermes-agent#21444 for symptom history."
         )
 
+    def _cli_model_limitations_hint(self, response_text: Optional[str]) -> Optional[str]:
+        """Return an actionable hint when a model response explains CLI-mode limitations.
+
+        Some models running in Hermes's ``chat_completions`` api_mode describe
+        themselves as a "remote CLI model" that can only do text I/O — no
+        filesystem, no shell, no network sockets.  This is the natural behaviour
+        when an OpenAI-Codex-family model is used without the ``codex_app_server``
+        runtime: the model knows it *could* execute code if given the right
+        scaffolding, so it explains the gap rather than silently failing.
+
+        Detecting this and surfacing ``/codex-runtime codex_app_server`` turns an
+        opaque "I can't help with that" into a one-command fix.
+
+        Only fires when:
+        * ``api_mode == "chat_completions"`` (the runtime that lacks execution)
+        * ``provider == "openai-codex"`` (the provider family that supports the
+          codex_app_server upgrade path)
+        * The response text contains the characteristic limitation phrases
+
+        Returns a hint string when the pattern matches, else ``None``.
+        """
+        if self.api_mode != "chat_completions":
+            return None
+        if self.provider != "openai-codex":
+            return None
+        if not response_text:
+            return None
+
+        text_lower = response_text.lower()
+
+        # Require at least two of these signals to avoid false positives on
+        # legitimate responses that happen to use "cli" or "execution".
+        # Signals are kept semantically distinct — no phrase is a substring of
+        # another — so each one that matches counts independently.
+        _SIGNALS = (
+            "cannot interact with your environment",
+            "raw cli turns",
+            "remote cli model",
+            "execution boundary",
+            "text-input/text-output state machine",
+            "text input/text output state machine",
+            "read-only memory context",
+            "platform limitation",
+            "access to the host's execution engine",
+        )
+        matched = sum(1 for s in _SIGNALS if s in text_lower)
+        if matched < 2:
+            return None
+
+        return (
+            "The model describes itself as a text-only CLI agent without execution "
+            "capabilities. This happens when openai-codex runs in Hermes's default "
+            "chat_completions mode. Enable the Codex app-server runtime to give it "
+            "a real terminal and filesystem: run `/codex-runtime codex_app_server` "
+            "(requires `npm i -g @openai/codex`). "
+            "After enabling, start a new session — the runtime change takes effect "
+            "on the next session to preserve prompt-cache for the current one."
+        )
+
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return base_url_host_matches(self._base_url_lower, "openrouter.ai")

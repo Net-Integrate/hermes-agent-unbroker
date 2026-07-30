@@ -4944,6 +4944,20 @@ def run_conversation(
 
                 codex_ack_continuations = 0
 
+                # Detect "CLI model limitations" responses from openai-codex in
+                # chat_completions mode. The model sometimes explains it cannot
+                # execute code or access the filesystem because it's running as a
+                # text-only agent. Surface a /codex-runtime hint so the user
+                # knows the one-command fix instead of wondering why it refuses.
+                _cli_hint_fn = getattr(agent, "_cli_model_limitations_hint", None)
+                if callable(_cli_hint_fn):
+                    try:
+                        _cli_hint = _cli_hint_fn(response_text=final_response)
+                        if _cli_hint:
+                            agent._buffer_vprint(f"💡 {_cli_hint}")
+                    except Exception:
+                        pass
+
                 if truncated_response_parts:
                     final_response = "".join(truncated_response_parts) + final_response
                     truncated_response_parts = []
