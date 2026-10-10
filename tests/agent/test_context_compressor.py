@@ -543,6 +543,64 @@ class TestNonStringContent:
         assert summary is None
         assert c._summary_failure_cooldown_until > 0
 
+    def test_length_capped_summary_retries_with_larger_cap(self):
+        """A reasoning model that burns the summary cap on hidden thinking ends
+        with finish_reason="length". Retrying the identical request after a
+        cooldown fails forever, so retry once with more output room."""
+        capped = MagicMock()
+        capped.choices = [MagicMock()]
+        capped.choices[0].finish_reason = "length"
+        capped.choices[0].message.content = "## Active Task\npartial"
+        complete = MagicMock()
+        complete.choices = [MagicMock()]
+        complete.choices[0].finish_reason = "stop"
+        complete.choices[0].message.content = "## Active Task\nfull summary"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", side_effect=[capped, complete]) as mock_call:
+            summary = c._generate_summary(messages)
+
+        assert mock_call.call_count == 2
+        first_cap = mock_call.call_args_list[0].kwargs["max_tokens"]
+        retry_cap = mock_call.call_args_list[1].kwargs["max_tokens"]
+        assert retry_cap > first_cap
+        assert retry_cap <= c.context_length
+        assert "full summary" in summary
+        assert "truncated" not in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_length_capped_summary_kept_when_retry_also_capped(self):
+        """If the retry is still capped, keep the partial summary (flagged)
+        instead of entering a cooldown loop that never compresses."""
+        capped = MagicMock()
+        capped.choices = [MagicMock()]
+        capped.choices[0].finish_reason = "length"
+        capped.choices[0].message.content = "## Active Task\npartial"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=capped) as mock_call:
+            summary = c._generate_summary(messages)
+
+        assert mock_call.call_count == 2
+        assert summary is not None
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
     def test_string_message_coerced_to_summary_content(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]

@@ -189,6 +189,17 @@ _HISTORICAL_SUMMARY_PREFIXES = (
     "config, etc.) may reflect work described here — avoid repeating it:",
 )
 
+def _summary_finish_reason(response: Any) -> str | None:
+    """Return ``choices[0].finish_reason`` from an object- or dict-shaped response."""
+    try:
+        choice = response.choices[0]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return None
+    if isinstance(choice, dict):
+        return choice.get("finish_reason")
+    return getattr(choice, "finish_reason", None)
+
+
 # Minimum tokens for the summary output
 _MIN_SUMMARY_TOKENS = 2000
 # Proportion of compressed content to allocate for summary
@@ -1855,6 +1866,22 @@ This compaction should PRIORITISE preserving all information related to the focu
             # retry (_generate_summary recursion) re-enters harmlessly.
             with aux_interrupt_protection():
                 response = call_llm(**call_kwargs)
+                # Reasoning models (e.g. local qwen3 with thinking on) can spend
+                # the whole summary cap on hidden reasoning and stop with
+                # finish_reason="length". Re-sending the same request after a
+                # cooldown fails identically every time, so retry once with
+                # more output room before giving up.
+                if _summary_finish_reason(response) == "length":
+                    _expanded = self._expanded_summary_max_tokens(call_kwargs["max_tokens"])
+                    if _expanded > call_kwargs["max_tokens"]:
+                        logger.info(
+                            "Context summary hit output cap (%d tokens); "
+                            "retrying once with %d",
+                            call_kwargs["max_tokens"], _expanded,
+                        )
+                        call_kwargs["max_tokens"] = _expanded
+                        response = call_llm(**call_kwargs)
+            _summary_truncated = _summary_finish_reason(response) == "length"
             # ``_validate_llm_response`` only guarantees ``choices[0].message``
             # exists, not that it's an object with ``.content``. Some
             # OpenAI-compatible proxies / local backends return a dict- or
@@ -1886,6 +1913,15 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = redact_sensitive_text(content.strip())
+            if _summary_truncated:
+                # A partial summary still carries the leading sections
+                # (Active Task, Goal, completed actions); keeping it beats
+                # aborting every compression while the context keeps growing.
+                logger.warning(
+                    "Context summary still truncated at %d output tokens; "
+                    "keeping partial summary", call_kwargs["max_tokens"],
+                )
+                summary += "\n\n[Summary truncated: summarizer hit its output token limit.]"
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
@@ -2044,6 +2080,16 @@ This compaction should PRIORITISE preserving all information related to the focu
                 _transient_cooldown,
             )
             return None
+
+    def _expanded_summary_max_tokens(self, current: int) -> int:
+        """Output cap for the one retry after a summary hits ``length``.
+
+        Quadruples the cap (room for hidden reasoning plus the summary) but
+        never past a quarter of the context window, so the retry request still
+        fits alongside the prompt being summarised.
+        """
+        ceiling = max(current, int((self.context_length or 0) * 0.25))
+        return min(current * 4, ceiling)
 
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:
