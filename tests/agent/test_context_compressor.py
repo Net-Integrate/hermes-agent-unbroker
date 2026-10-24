@@ -9,6 +9,7 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    _summary_finish_reason,
 )
 from hermes_state import SessionDB
 
@@ -3331,3 +3332,247 @@ class TestDoubleCompactionSummaryRole:
             "summary of earlier turns" in (m.get("content") or "")
             for m in result
         )
+
+
+def _summary_response(content, finish_reason="stop"):
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].finish_reason = finish_reason
+    response.choices[0].message.content = content
+    return response
+
+
+_LENGTH_CAP_TURNS = [
+    {"role": "user", "content": "do something"},
+    {"role": "assistant", "content": "ok"},
+]
+
+
+class TestLengthCappedSummary:
+    """A summarizer that stops on finish_reason="length" (e.g. a reasoning
+    model spending the cap on hidden thinking) gets one retry with more
+    output room, and a still-capped result is kept as a flagged partial."""
+
+    @pytest.fixture(autouse=True)
+    def _cap_forwarded(self):
+        """Most cases model an endpoint that receives max_tokens (Anthropic
+        wire / NVIDIA NIM); the custom-provider case overrides this."""
+        with patch("agent.context_compressor.aux_forwards_max_tokens", return_value=True):
+            yield
+
+    def _compressor(self, context_length=100000, **kwargs):
+        with patch("agent.context_compressor.get_model_context_length", return_value=context_length):
+            return ContextCompressor(model="test", quiet_mode=True, **kwargs)
+
+    def test_retry_uses_larger_cap_bounded_by_quarter_window(self):
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+        complete = _summary_response("## Active Task\nfull summary")
+
+        with patch("agent.context_compressor.call_llm", side_effect=[capped, complete]) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        first_cap = mock_call.call_args_list[0].kwargs["max_tokens"]
+        retry_cap = mock_call.call_args_list[1].kwargs["max_tokens"]
+        assert retry_cap == min(first_cap * 4, c.context_length // 4)
+        assert retry_cap > first_cap
+        assert "full summary" in summary
+        assert "truncated" not in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_still_capped_retry_keeps_flagged_partial(self):
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+
+        with patch("agent.context_compressor.call_llm", return_value=capped) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_retry_error_keeps_first_partial(self):
+        """A larger cap can exceed the provider's output limit; the error must
+        not discard the partial summary the first call already produced."""
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[capped, RuntimeError("400 max_tokens too large")],
+        ) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        assert summary is not None
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_empty_retry_keeps_first_partial(self):
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+        empty = _summary_response("   ", "stop")
+
+        with patch("agent.context_compressor.call_llm", side_effect=[capped, empty]) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_no_retry_when_endpoint_drops_max_tokens(self):
+        """Custom/OpenAI-compatible aux endpoints never receive max_tokens, so
+        a larger cap can't help; keep the partial without a wasted call."""
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+
+        with patch("agent.context_compressor.aux_forwards_max_tokens", return_value=False), \
+                patch("agent.context_compressor.call_llm", return_value=capped) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 1
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+
+    def test_empty_capped_output_is_still_a_failure(self):
+        """All output spent on hidden reasoning leaves no visible text; that
+        stays a failure (cooldown), never an empty summary."""
+        c = self._compressor()
+        empty = _summary_response("", "length")
+
+        with patch("agent.context_compressor.call_llm", return_value=empty) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        assert summary is None
+        assert c._summary_failure_cooldown_until > 0
+
+    def test_small_window_skips_retry_and_keeps_partial(self):
+        """When a quarter of the window is no bigger than the current cap there
+        is no room to retry; the partial is kept immediately."""
+        c = self._compressor(context_length=8000)
+        capped = _summary_response("## Active Task\npartial", "length")
+
+        with patch("agent.context_compressor.call_llm", return_value=capped) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 1
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+
+    def test_retry_cap_bounded_by_smaller_summary_model_window(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="small-summarizer",
+                quiet_mode=True,
+            )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=16000):
+            assert c._expanded_summary_max_tokens(2600) == 16000 // 4
+
+    def test_aux_compression_endpoint_probed_with_its_own_credentials(self):
+        """The auxiliary.compression summarizer is looked up with its own
+        base_url/api_key/provider, so a local endpoint's real window applies."""
+        c = self._compressor(context_length=200000)
+
+        with patch(
+            "agent.context_compressor._resolve_task_provider_model",
+            return_value=("custom", "local-summarizer", "http://127.0.0.1:9000/v1", "sk-local", None),
+        ), patch(
+            "agent.context_compressor.get_model_context_length", return_value=16000,
+        ) as mock_ctx:
+            cap = c._expanded_summary_max_tokens(2600)
+
+        assert cap == 16000 // 4
+        mock_ctx.assert_called_once_with(
+            "local-summarizer",
+            base_url="http://127.0.0.1:9000/v1",
+            api_key="sk-local",
+            provider="custom",
+        )
+
+    def test_main_model_summarizer_uses_main_window(self):
+        c = self._compressor(context_length=100000)
+
+        with patch(
+            "agent.context_compressor._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch("agent.context_compressor.get_model_context_length") as mock_ctx:
+            cap = c._expanded_summary_max_tokens(2600)
+
+        mock_ctx.assert_not_called()
+        assert cap == min(2600 * 4, 100000 // 4)
+
+    def test_truncation_note_does_not_stack_across_compactions(self):
+        c = self._compressor()
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_summary_response("## Active Task\npartial", "length"),
+        ):
+            c._generate_summary(_LENGTH_CAP_TURNS)
+        echoed = _summary_response(c._previous_summary + "\nmore", "length")
+        with patch("agent.context_compressor.call_llm", return_value=echoed):
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert summary.lower().count("summary truncated") == 1
+
+    def test_stale_truncation_note_dropped_from_complete_summary(self):
+        """A later uncapped summary that echoes the previous body must not
+        carry the earlier truncation note forward."""
+        c = self._compressor()
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_summary_response("## Active Task\npartial", "length"),
+        ):
+            c._generate_summary(_LENGTH_CAP_TURNS)
+        echoed = _summary_response(c._previous_summary + "\nmore")
+        with patch("agent.context_compressor.call_llm", return_value=echoed):
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert "summary truncated" not in summary.lower()
+        assert "more" in summary
+
+
+class TestSummaryFinishReason:
+    def test_object_shaped_response(self):
+        assert _summary_finish_reason(_summary_response("x", "length")) == "length"
+
+    def test_dict_shaped_response_and_choice(self):
+        assert _summary_finish_reason({"choices": [{"finish_reason": "length"}]}) == "length"
+
+    def test_case_insensitive(self):
+        assert _summary_finish_reason({"choices": [{"finish_reason": "LENGTH"}]}) == "length"
+
+    def test_unrecognised_shapes_return_none(self):
+        assert _summary_finish_reason(None) is None
+        assert _summary_finish_reason({"choices": []}) is None
+        assert _summary_finish_reason({"choices": [{}]}) is None
+
+
+@pytest.mark.parametrize(
+    "provider, base_url",
+    [
+        ("custom", "http://127.0.0.1:11132/v1"),
+        ("openrouter", None),
+        ("minimax", None),
+        ("custom", "https://example.com/anthropic"),
+        ("nvidia", None),
+    ],
+)
+def test_aux_forwards_max_tokens_matches_built_request(provider, base_url):
+    """The retry gate and the request builder must agree on whether the
+    output cap reaches the wire."""
+    from agent.auxiliary_client import _build_call_kwargs, aux_forwards_max_tokens
+
+    kwargs = _build_call_kwargs(
+        provider, "some-model", [{"role": "user", "content": "x"}],
+        max_tokens=1234, base_url=base_url,
+    )
+    assert ("max_tokens" in kwargs) == aux_forwards_max_tokens(provider, base_url)

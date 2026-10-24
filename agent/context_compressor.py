@@ -24,7 +24,13 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
+from agent.auxiliary_client import (
+    call_llm,
+    _is_connection_error,
+    _resolve_task_provider_model,
+    aux_forwards_max_tokens,
+    aux_interrupt_protection,
+)
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -189,12 +195,44 @@ _HISTORICAL_SUMMARY_PREFIXES = (
     "config, etc.) may reflect work described here — avoid repeating it:",
 )
 
+def _summary_finish_reason(response: Any) -> str | None:
+    """Return the lowercased ``choices[0].finish_reason`` of a response.
+
+    Accepts object- or dict-shaped responses and choices; returns None when
+    the shape is unrecognised.
+    """
+    choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+    try:
+        choice = choices[0]
+    except (IndexError, KeyError, TypeError):
+        return None
+    reason = choice.get("finish_reason") if isinstance(choice, dict) else getattr(choice, "finish_reason", None)
+    return reason.lower() if isinstance(reason, str) else None
+
+
+def _response_content(response: Any) -> str:
+    """Return ``choices[0].message.content`` as a string ("" when absent)."""
+    message = response.choices[0].message
+    if isinstance(message, dict):
+        content = message.get("content")
+    else:
+        content = getattr(message, "content", message)
+    if not isinstance(content, str):
+        content = str(content) if content else ""
+    return content
+
+
 # Minimum tokens for the summary output
 _MIN_SUMMARY_TOKENS = 2000
 # Proportion of compressed content to allocate for summary
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
+# One retry after a summary stops on finish_reason="length": multiply the
+# output cap by this, bounded to this share of the summarizer's context window.
+_SUMMARY_RETRY_MULTIPLIER = 4
+_SUMMARY_RETRY_MAX_CONTEXT_RATIO = 0.25
+_SUMMARY_TRUNCATED_NOTE = "[Summary truncated: summarizer hit its output token limit.]"
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -1855,18 +1893,44 @@ This compaction should PRIORITISE preserving all information related to the focu
             # retry (_generate_summary recursion) re-enters harmlessly.
             with aux_interrupt_protection():
                 response = call_llm(**call_kwargs)
+                # Reasoning models (e.g. local qwen3 with thinking on) can spend
+                # the whole summary cap on hidden reasoning and stop with
+                # finish_reason="length". Re-sending the same request after a
+                # cooldown fails identically every time, so retry once with
+                # more output room before giving up.
+                if _summary_finish_reason(response) == "length":
+                    _expanded = self._expanded_summary_max_tokens(call_kwargs["max_tokens"])
+                    if _expanded > call_kwargs["max_tokens"]:
+                        logger.info(
+                            "Context summary hit output cap (%d tokens); "
+                            "retrying once with %d",
+                            call_kwargs["max_tokens"], _expanded,
+                        )
+                        _capped_response = response
+                        call_kwargs["max_tokens"] = _expanded
+                        try:
+                            response = call_llm(**call_kwargs)
+                            if not _response_content(response).strip():
+                                raise RuntimeError("retry returned empty content")
+                        except Exception as retry_err:
+                            # The larger cap can exceed a provider's output
+                            # limit, or the retry can come back empty. Keep
+                            # the first partial summary rather than losing it
+                            # to the error path.
+                            if not _response_content(_capped_response).strip():
+                                raise
+                            logger.warning(
+                                "Context summary retry failed (%s); keeping "
+                                "the first partial summary", retry_err,
+                            )
+                            response = _capped_response
+                _summary_truncated = _summary_finish_reason(response) == "length"
             # ``_validate_llm_response`` only guarantees ``choices[0].message``
             # exists, not that it's an object with ``.content``. Some
             # OpenAI-compatible proxies / local backends return a dict- or
-            # str-shaped message; coerce defensively instead of crashing.
-            message = response.choices[0].message
-            if isinstance(message, dict):
-                content = message.get("content")
-            else:
-                content = getattr(message, "content", message)
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
-            if not isinstance(content, str):
-                content = str(content) if content else ""
+            # str-shaped message (e.g. a dict from llama.cpp); coerce
+            # defensively instead of crashing.
+            content = _response_content(response)
             # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels)
             # return a well-formed HTTP 200 with an empty or whitespace-only
             # ``content`` instead of an error or empty ``choices``. That payload
@@ -1886,6 +1950,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = redact_sensitive_text(content.strip())
+            # The iterative prompt feeds the previous summary back in, so a
+            # truncation note from an earlier capped pass can be echoed; drop
+            # it and re-add only when this summary was itself capped.
+            summary = summary.replace(_SUMMARY_TRUNCATED_NOTE, "").rstrip()
+            if _summary_truncated:
+                # A partial summary still carries the leading sections
+                # (Active Task, Goal, completed actions); keeping it beats
+                # aborting every compression while the context keeps growing.
+                logger.warning(
+                    "Context summary still truncated at %d output tokens; "
+                    "keeping partial summary", call_kwargs["max_tokens"],
+                )
+                summary += "\n\n" + _SUMMARY_TRUNCATED_NOTE
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
@@ -2044,6 +2121,65 @@ This compaction should PRIORITISE preserving all information related to the focu
                 _transient_cooldown,
             )
             return None
+
+    def _expanded_summary_max_tokens(self, current: int) -> int:
+        """Output cap for the one retry after a summary hits ``length``.
+
+        Multiplies the cap (room for hidden reasoning plus the summary) but
+        never past a share of the summarizer's context window, so the retry
+        request still fits alongside the prompt being summarised.
+        """
+        runtime = self._summarizer_runtime()
+        if runtime is None or not aux_forwards_max_tokens(runtime[0], runtime[2]):
+            # Auxiliary calls omit max_tokens for this endpoint, so a larger
+            # cap would never reach the server and the retry would repeat the
+            # identical request.
+            return current
+        window = self.context_length or 0
+        summary_window = self._summarizer_context_length(runtime)
+        if summary_window:
+            window = min(window, summary_window) if window else summary_window
+        ceiling = max(current, int(window * _SUMMARY_RETRY_MAX_CONTEXT_RATIO))
+        return min(current * _SUMMARY_RETRY_MULTIPLIER, ceiling)
+
+    def _summarizer_runtime(self) -> tuple | None:
+        """(provider, model, base_url, api_key) the compression summary call
+        resolves to, mirroring ``call_llm``; None when it cannot be resolved.
+
+        "auto" routes through the main runtime's endpoint. ``model`` is None
+        when an explicit provider is configured without a model.
+        """
+        try:
+            provider, model, base_url, api_key, _ = _resolve_task_provider_model(
+                "compression", model=self.summary_model or None,
+            )
+        except Exception:
+            return None
+        if provider in (None, "auto") and not base_url:
+            return self.provider, model or self.model, self.base_url, self.api_key
+        return provider, model, base_url, api_key
+
+    def _summarizer_context_length(self, runtime: tuple | None) -> int:
+        """Context window of the model that writes summaries, when it differs
+        from the main model; 0 when it is the main model or unknown.
+
+        Probes the summarizer with its own base_url and credentials rather
+        than looking it up by bare model name.
+        """
+        if runtime is None:
+            return 0
+        provider, model, base_url, api_key = runtime
+        if not model or (model == self.model and base_url == self.base_url):
+            return 0
+        try:
+            return get_model_context_length(
+                model,
+                base_url=base_url or "",
+                api_key=api_key or "",
+                provider=provider or "",
+            )
+        except Exception:
+            return 0
 
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:

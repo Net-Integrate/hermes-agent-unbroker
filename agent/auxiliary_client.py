@@ -5725,6 +5725,23 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
 
 
 
+def aux_forwards_max_tokens(provider: Optional[str], base_url: Optional[str]) -> bool:
+    """Whether auxiliary calls send ``max_tokens`` on the wire for this endpoint.
+
+    Only Anthropic-wire endpoints and NVIDIA NIM receive the cap; every other
+    provider gets no output cap (see ``_build_call_kwargs``).
+    """
+    _effective_base = base_url or (
+        _current_custom_base_url() if provider == "custom" else ""
+    )
+    _provider_norm = str(provider or "").strip().lower()
+    _is_nvidia_nim = (
+        _provider_norm in {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
+        or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
+    )
+    return _is_anthropic_compat_endpoint(provider, _effective_base) or _is_nvidia_nim
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -5781,18 +5798,7 @@ def _build_call_kwargs(
         # 200 with an empty choices[] payload when max_tokens is omitted. The main
         # NVIDIA chat path already sends an output cap via the provider profile;
         # preserve it on the auxiliary path too.
-        _effective_base = base_url or (
-            _current_custom_base_url() if provider == "custom" else ""
-        )
-        _provider_norm = str(provider or "").strip().lower()
-        _is_nvidia_nim = (
-            _provider_norm in {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
-            or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
-        )
-        if (
-            _is_anthropic_compat_endpoint(provider, _effective_base)
-            or _is_nvidia_nim
-        ):
+        if aux_forwards_max_tokens(provider, base_url):
             kwargs["max_tokens"] = max_tokens
 
     if tools:
