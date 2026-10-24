@@ -28,6 +28,7 @@ from agent.auxiliary_client import (
     call_llm,
     _is_connection_error,
     _resolve_task_provider_model,
+    aux_forwards_max_tokens,
     aux_interrupt_protection,
 )
 from agent.context_engine import ContextEngine
@@ -1909,10 +1910,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                         call_kwargs["max_tokens"] = _expanded
                         try:
                             response = call_llm(**call_kwargs)
+                            if not _response_content(response).strip():
+                                raise RuntimeError("retry returned empty content")
                         except Exception as retry_err:
                             # The larger cap can exceed a provider's output
-                            # limit. Keep the first partial summary rather
-                            # than losing it to the error path.
+                            # limit, or the retry can come back empty. Keep
+                            # the first partial summary rather than losing it
+                            # to the error path.
                             if not _response_content(_capped_response).strip():
                                 raise
                             logger.warning(
@@ -2125,34 +2129,48 @@ This compaction should PRIORITISE preserving all information related to the focu
         never past a share of the summarizer's context window, so the retry
         request still fits alongside the prompt being summarised.
         """
+        runtime = self._summarizer_runtime()
+        if runtime is None or not aux_forwards_max_tokens(runtime[0], runtime[2]):
+            # Auxiliary calls omit max_tokens for this endpoint, so a larger
+            # cap would never reach the server and the retry would repeat the
+            # identical request.
+            return current
         window = self.context_length or 0
-        summary_window = self._summarizer_context_length()
+        summary_window = self._summarizer_context_length(runtime)
         if summary_window:
             window = min(window, summary_window) if window else summary_window
         ceiling = max(current, int(window * _SUMMARY_RETRY_MAX_CONTEXT_RATIO))
         return min(current * _SUMMARY_RETRY_MULTIPLIER, ceiling)
 
-    def _summarizer_context_length(self) -> int:
-        """Context window of the model that writes summaries, when it differs
-        from the main model; 0 when it is the main model or unknown.
+    def _summarizer_runtime(self) -> tuple | None:
+        """(provider, model, base_url, api_key) the compression summary call
+        resolves to, mirroring ``call_llm``; None when it cannot be resolved.
 
-        Resolves ``auxiliary.compression`` the same way ``call_llm`` does, so
-        a custom/local summarizer endpoint is probed with its own base_url and
-        credentials rather than looked up by bare model name.
+        "auto" routes through the main runtime's endpoint. ``model`` is None
+        when an explicit provider is configured without a model.
         """
         try:
             provider, model, base_url, api_key, _ = _resolve_task_provider_model(
                 "compression", model=self.summary_model or None,
             )
         except Exception:
-            return 0
-        if not model:
-            return 0
+            return None
         if provider in (None, "auto") and not base_url:
-            # "auto" routes the summary through the main runtime's endpoint.
-            if model == self.model:
-                return 0
-            provider, base_url, api_key = self.provider, self.base_url, self.api_key
+            return self.provider, model or self.model, self.base_url, self.api_key
+        return provider, model, base_url, api_key
+
+    def _summarizer_context_length(self, runtime: tuple | None) -> int:
+        """Context window of the model that writes summaries, when it differs
+        from the main model; 0 when it is the main model or unknown.
+
+        Probes the summarizer with its own base_url and credentials rather
+        than looking it up by bare model name.
+        """
+        if runtime is None:
+            return 0
+        provider, model, base_url, api_key = runtime
+        if not model or (model == self.model and base_url == self.base_url):
+            return 0
         try:
             return get_model_context_length(
                 model,

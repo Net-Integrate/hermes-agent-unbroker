@@ -3353,6 +3353,13 @@ class TestLengthCappedSummary:
     model spending the cap on hidden thinking) gets one retry with more
     output room, and a still-capped result is kept as a flagged partial."""
 
+    @pytest.fixture(autouse=True)
+    def _cap_forwarded(self):
+        """Most cases model an endpoint that receives max_tokens (Anthropic
+        wire / NVIDIA NIM); the custom-provider case overrides this."""
+        with patch("agent.context_compressor.aux_forwards_max_tokens", return_value=True):
+            yield
+
     def _compressor(self, context_length=100000, **kwargs):
         with patch("agent.context_compressor.get_model_context_length", return_value=context_length):
             return ContextCompressor(model="test", quiet_mode=True, **kwargs)
@@ -3403,6 +3410,33 @@ class TestLengthCappedSummary:
         assert "partial" in summary
         assert "truncated" in summary.lower()
         assert c._summary_failure_cooldown_until == 0
+
+    def test_empty_retry_keeps_first_partial(self):
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+        empty = _summary_response("   ", "stop")
+
+        with patch("agent.context_compressor.call_llm", side_effect=[capped, empty]) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_no_retry_when_endpoint_drops_max_tokens(self):
+        """Custom/OpenAI-compatible aux endpoints never receive max_tokens, so
+        a larger cap can't help; keep the partial without a wasted call."""
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+
+        with patch("agent.context_compressor.aux_forwards_max_tokens", return_value=False), \
+                patch("agent.context_compressor.call_llm", return_value=capped) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 1
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
 
     def test_empty_capped_output_is_still_a_failure(self):
         """All output spent on hidden reasoning leaves no visible text; that
@@ -3520,3 +3554,25 @@ class TestSummaryFinishReason:
         assert _summary_finish_reason(None) is None
         assert _summary_finish_reason({"choices": []}) is None
         assert _summary_finish_reason({"choices": [{}]}) is None
+
+
+@pytest.mark.parametrize(
+    "provider, base_url",
+    [
+        ("custom", "http://127.0.0.1:11132/v1"),
+        ("openrouter", None),
+        ("minimax", None),
+        ("custom", "https://example.com/anthropic"),
+        ("nvidia", None),
+    ],
+)
+def test_aux_forwards_max_tokens_matches_built_request(provider, base_url):
+    """The retry gate and the request builder must agree on whether the
+    output cap reaches the wire."""
+    from agent.auxiliary_client import _build_call_kwargs, aux_forwards_max_tokens
+
+    kwargs = _build_call_kwargs(
+        provider, "some-model", [{"role": "user", "content": "x"}],
+        max_tokens=1234, base_url=base_url,
+    )
+    assert ("max_tokens" in kwargs) == aux_forwards_max_tokens(provider, base_url)
