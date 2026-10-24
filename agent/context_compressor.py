@@ -24,7 +24,12 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
+from agent.auxiliary_client import (
+    call_llm,
+    _is_connection_error,
+    _resolve_task_provider_model,
+    aux_interrupt_protection,
+)
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -1941,6 +1946,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = redact_sensitive_text(content.strip())
+            # The iterative prompt feeds the previous summary back in, so a
+            # truncation note from an earlier capped pass can be echoed; drop
+            # it and re-add only when this summary was itself capped.
+            summary = summary.replace(_SUMMARY_TRUNCATED_NOTE, "").rstrip()
             if _summary_truncated:
                 # A partial summary still carries the leading sections
                 # (Active Task, Goal, completed actions); keeping it beats
@@ -1949,9 +1958,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "Context summary still truncated at %d output tokens; "
                     "keeping partial summary", call_kwargs["max_tokens"],
                 )
-                # Drop a note echoed from the previous summary so iterative
-                # updates don't stack them.
-                summary = summary.replace(_SUMMARY_TRUNCATED_NOTE, "").rstrip()
                 summary += "\n\n" + _SUMMARY_TRUNCATED_NOTE
             # Store for iterative updates on next compaction
             self._previous_summary = summary
@@ -2120,17 +2126,42 @@ This compaction should PRIORITISE preserving all information related to the focu
         request still fits alongside the prompt being summarised.
         """
         window = self.context_length or 0
-        if self.summary_model and self.summary_model != self.model:
-            # A distinct auxiliary summarizer may have a smaller window than
-            # the main model; bound by whichever is smaller.
-            try:
-                summary_window = get_model_context_length(self.summary_model)
-            except Exception:
-                summary_window = 0
-            if summary_window:
-                window = min(window, summary_window) if window else summary_window
+        summary_window = self._summarizer_context_length()
+        if summary_window:
+            window = min(window, summary_window) if window else summary_window
         ceiling = max(current, int(window * _SUMMARY_RETRY_MAX_CONTEXT_RATIO))
         return min(current * _SUMMARY_RETRY_MULTIPLIER, ceiling)
+
+    def _summarizer_context_length(self) -> int:
+        """Context window of the model that writes summaries, when it differs
+        from the main model; 0 when it is the main model or unknown.
+
+        Resolves ``auxiliary.compression`` the same way ``call_llm`` does, so
+        a custom/local summarizer endpoint is probed with its own base_url and
+        credentials rather than looked up by bare model name.
+        """
+        try:
+            provider, model, base_url, api_key, _ = _resolve_task_provider_model(
+                "compression", model=self.summary_model or None,
+            )
+        except Exception:
+            return 0
+        if not model:
+            return 0
+        if provider in (None, "auto") and not base_url:
+            # "auto" routes the summary through the main runtime's endpoint.
+            if model == self.model:
+                return 0
+            provider, base_url, api_key = self.provider, self.base_url, self.api_key
+        try:
+            return get_model_context_length(
+                model,
+                base_url=base_url or "",
+                api_key=api_key or "",
+                provider=provider or "",
+            )
+        except Exception:
+            return 0
 
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:

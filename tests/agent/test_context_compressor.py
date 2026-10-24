@@ -3441,6 +3441,39 @@ class TestLengthCappedSummary:
         with patch("agent.context_compressor.get_model_context_length", return_value=16000):
             assert c._expanded_summary_max_tokens(2600) == 16000 // 4
 
+    def test_aux_compression_endpoint_probed_with_its_own_credentials(self):
+        """The auxiliary.compression summarizer is looked up with its own
+        base_url/api_key/provider, so a local endpoint's real window applies."""
+        c = self._compressor(context_length=200000)
+
+        with patch(
+            "agent.context_compressor._resolve_task_provider_model",
+            return_value=("custom", "local-summarizer", "http://127.0.0.1:9000/v1", "sk-local", None),
+        ), patch(
+            "agent.context_compressor.get_model_context_length", return_value=16000,
+        ) as mock_ctx:
+            cap = c._expanded_summary_max_tokens(2600)
+
+        assert cap == 16000 // 4
+        mock_ctx.assert_called_once_with(
+            "local-summarizer",
+            base_url="http://127.0.0.1:9000/v1",
+            api_key="sk-local",
+            provider="custom",
+        )
+
+    def test_main_model_summarizer_uses_main_window(self):
+        c = self._compressor(context_length=100000)
+
+        with patch(
+            "agent.context_compressor._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch("agent.context_compressor.get_model_context_length") as mock_ctx:
+            cap = c._expanded_summary_max_tokens(2600)
+
+        mock_ctx.assert_not_called()
+        assert cap == min(2600 * 4, 100000 // 4)
+
     def test_truncation_note_does_not_stack_across_compactions(self):
         c = self._compressor()
 
@@ -3454,6 +3487,23 @@ class TestLengthCappedSummary:
             summary = c._generate_summary(_LENGTH_CAP_TURNS)
 
         assert summary.lower().count("summary truncated") == 1
+
+    def test_stale_truncation_note_dropped_from_complete_summary(self):
+        """A later uncapped summary that echoes the previous body must not
+        carry the earlier truncation note forward."""
+        c = self._compressor()
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_summary_response("## Active Task\npartial", "length"),
+        ):
+            c._generate_summary(_LENGTH_CAP_TURNS)
+        echoed = _summary_response(c._previous_summary + "\nmore")
+        with patch("agent.context_compressor.call_llm", return_value=echoed):
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert "summary truncated" not in summary.lower()
+        assert "more" in summary
 
 
 class TestSummaryFinishReason:
