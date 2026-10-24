@@ -190,14 +190,30 @@ _HISTORICAL_SUMMARY_PREFIXES = (
 )
 
 def _summary_finish_reason(response: Any) -> str | None:
-    """Return ``choices[0].finish_reason`` from an object- or dict-shaped response."""
+    """Return the lowercased ``choices[0].finish_reason`` of a response.
+
+    Accepts object- or dict-shaped responses and choices; returns None when
+    the shape is unrecognised.
+    """
+    choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
     try:
-        choice = response.choices[0]
-    except (AttributeError, IndexError, KeyError, TypeError):
+        choice = choices[0]
+    except (IndexError, KeyError, TypeError):
         return None
-    if isinstance(choice, dict):
-        return choice.get("finish_reason")
-    return getattr(choice, "finish_reason", None)
+    reason = choice.get("finish_reason") if isinstance(choice, dict) else getattr(choice, "finish_reason", None)
+    return reason.lower() if isinstance(reason, str) else None
+
+
+def _response_content(response: Any) -> str:
+    """Return ``choices[0].message.content`` as a string ("" when absent)."""
+    message = response.choices[0].message
+    if isinstance(message, dict):
+        content = message.get("content")
+    else:
+        content = getattr(message, "content", message)
+    if not isinstance(content, str):
+        content = str(content) if content else ""
+    return content
 
 
 # Minimum tokens for the summary output
@@ -206,6 +222,11 @@ _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
+# One retry after a summary stops on finish_reason="length": multiply the
+# output cap by this, bounded to this share of the summarizer's context window.
+_SUMMARY_RETRY_MULTIPLIER = 4
+_SUMMARY_RETRY_MAX_CONTEXT_RATIO = 0.25
+_SUMMARY_TRUNCATED_NOTE = "[Summary truncated: summarizer hit its output token limit.]"
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -1879,21 +1900,28 @@ This compaction should PRIORITISE preserving all information related to the focu
                             "retrying once with %d",
                             call_kwargs["max_tokens"], _expanded,
                         )
+                        _capped_response = response
                         call_kwargs["max_tokens"] = _expanded
-                        response = call_llm(**call_kwargs)
-            _summary_truncated = _summary_finish_reason(response) == "length"
+                        try:
+                            response = call_llm(**call_kwargs)
+                        except Exception as retry_err:
+                            # The larger cap can exceed a provider's output
+                            # limit. Keep the first partial summary rather
+                            # than losing it to the error path.
+                            if not _response_content(_capped_response).strip():
+                                raise
+                            logger.warning(
+                                "Context summary retry failed (%s); keeping "
+                                "the first partial summary", retry_err,
+                            )
+                            response = _capped_response
+                _summary_truncated = _summary_finish_reason(response) == "length"
             # ``_validate_llm_response`` only guarantees ``choices[0].message``
             # exists, not that it's an object with ``.content``. Some
             # OpenAI-compatible proxies / local backends return a dict- or
-            # str-shaped message; coerce defensively instead of crashing.
-            message = response.choices[0].message
-            if isinstance(message, dict):
-                content = message.get("content")
-            else:
-                content = getattr(message, "content", message)
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
-            if not isinstance(content, str):
-                content = str(content) if content else ""
+            # str-shaped message (e.g. a dict from llama.cpp); coerce
+            # defensively instead of crashing.
+            content = _response_content(response)
             # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels)
             # return a well-formed HTTP 200 with an empty or whitespace-only
             # ``content`` instead of an error or empty ``choices``. That payload
@@ -1921,7 +1949,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "Context summary still truncated at %d output tokens; "
                     "keeping partial summary", call_kwargs["max_tokens"],
                 )
-                summary += "\n\n[Summary truncated: summarizer hit its output token limit.]"
+                # Drop a note echoed from the previous summary so iterative
+                # updates don't stack them.
+                summary = summary.replace(_SUMMARY_TRUNCATED_NOTE, "").rstrip()
+                summary += "\n\n" + _SUMMARY_TRUNCATED_NOTE
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
@@ -2084,12 +2115,22 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _expanded_summary_max_tokens(self, current: int) -> int:
         """Output cap for the one retry after a summary hits ``length``.
 
-        Quadruples the cap (room for hidden reasoning plus the summary) but
-        never past a quarter of the context window, so the retry request still
-        fits alongside the prompt being summarised.
+        Multiplies the cap (room for hidden reasoning plus the summary) but
+        never past a share of the summarizer's context window, so the retry
+        request still fits alongside the prompt being summarised.
         """
-        ceiling = max(current, int((self.context_length or 0) * 0.25))
-        return min(current * 4, ceiling)
+        window = self.context_length or 0
+        if self.summary_model and self.summary_model != self.model:
+            # A distinct auxiliary summarizer may have a smaller window than
+            # the main model; bound by whichever is smaller.
+            try:
+                summary_window = get_model_context_length(self.summary_model)
+            except Exception:
+                summary_window = 0
+            if summary_window:
+                window = min(window, summary_window) if window else summary_window
+        ceiling = max(current, int(window * _SUMMARY_RETRY_MAX_CONTEXT_RATIO))
+        return min(current * _SUMMARY_RETRY_MULTIPLIER, ceiling)
 
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:

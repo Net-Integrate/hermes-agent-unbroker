@@ -9,6 +9,7 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    _summary_finish_reason,
 )
 from hermes_state import SessionDB
 
@@ -542,64 +543,6 @@ class TestNonStringContent:
         assert c._summary_model_fallen_back is True
         assert summary is None
         assert c._summary_failure_cooldown_until > 0
-
-    def test_length_capped_summary_retries_with_larger_cap(self):
-        """A reasoning model that burns the summary cap on hidden thinking ends
-        with finish_reason="length". Retrying the identical request after a
-        cooldown fails forever, so retry once with more output room."""
-        capped = MagicMock()
-        capped.choices = [MagicMock()]
-        capped.choices[0].finish_reason = "length"
-        capped.choices[0].message.content = "## Active Task\npartial"
-        complete = MagicMock()
-        complete.choices = [MagicMock()]
-        complete.choices[0].finish_reason = "stop"
-        complete.choices[0].message.content = "## Active Task\nfull summary"
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True)
-
-        messages = [
-            {"role": "user", "content": "do something"},
-            {"role": "assistant", "content": "ok"},
-        ]
-
-        with patch("agent.context_compressor.call_llm", side_effect=[capped, complete]) as mock_call:
-            summary = c._generate_summary(messages)
-
-        assert mock_call.call_count == 2
-        first_cap = mock_call.call_args_list[0].kwargs["max_tokens"]
-        retry_cap = mock_call.call_args_list[1].kwargs["max_tokens"]
-        assert retry_cap > first_cap
-        assert retry_cap <= c.context_length
-        assert "full summary" in summary
-        assert "truncated" not in summary.lower()
-        assert c._summary_failure_cooldown_until == 0
-
-    def test_length_capped_summary_kept_when_retry_also_capped(self):
-        """If the retry is still capped, keep the partial summary (flagged)
-        instead of entering a cooldown loop that never compresses."""
-        capped = MagicMock()
-        capped.choices = [MagicMock()]
-        capped.choices[0].finish_reason = "length"
-        capped.choices[0].message.content = "## Active Task\npartial"
-
-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True)
-
-        messages = [
-            {"role": "user", "content": "do something"},
-            {"role": "assistant", "content": "ok"},
-        ]
-
-        with patch("agent.context_compressor.call_llm", return_value=capped) as mock_call:
-            summary = c._generate_summary(messages)
-
-        assert mock_call.call_count == 2
-        assert summary is not None
-        assert "partial" in summary
-        assert "truncated" in summary.lower()
-        assert c._summary_failure_cooldown_until == 0
 
     def test_string_message_coerced_to_summary_content(self):
         mock_response = MagicMock()
@@ -3389,3 +3332,141 @@ class TestDoubleCompactionSummaryRole:
             "summary of earlier turns" in (m.get("content") or "")
             for m in result
         )
+
+
+def _summary_response(content, finish_reason="stop"):
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].finish_reason = finish_reason
+    response.choices[0].message.content = content
+    return response
+
+
+_LENGTH_CAP_TURNS = [
+    {"role": "user", "content": "do something"},
+    {"role": "assistant", "content": "ok"},
+]
+
+
+class TestLengthCappedSummary:
+    """A summarizer that stops on finish_reason="length" (e.g. a reasoning
+    model spending the cap on hidden thinking) gets one retry with more
+    output room, and a still-capped result is kept as a flagged partial."""
+
+    def _compressor(self, context_length=100000, **kwargs):
+        with patch("agent.context_compressor.get_model_context_length", return_value=context_length):
+            return ContextCompressor(model="test", quiet_mode=True, **kwargs)
+
+    def test_retry_uses_larger_cap_bounded_by_quarter_window(self):
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+        complete = _summary_response("## Active Task\nfull summary")
+
+        with patch("agent.context_compressor.call_llm", side_effect=[capped, complete]) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        first_cap = mock_call.call_args_list[0].kwargs["max_tokens"]
+        retry_cap = mock_call.call_args_list[1].kwargs["max_tokens"]
+        assert retry_cap == min(first_cap * 4, c.context_length // 4)
+        assert retry_cap > first_cap
+        assert "full summary" in summary
+        assert "truncated" not in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_still_capped_retry_keeps_flagged_partial(self):
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+
+        with patch("agent.context_compressor.call_llm", return_value=capped) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_retry_error_keeps_first_partial(self):
+        """A larger cap can exceed the provider's output limit; the error must
+        not discard the partial summary the first call already produced."""
+        c = self._compressor()
+        capped = _summary_response("## Active Task\npartial", "length")
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[capped, RuntimeError("400 max_tokens too large")],
+        ) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        assert summary is not None
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+        assert c._summary_failure_cooldown_until == 0
+
+    def test_empty_capped_output_is_still_a_failure(self):
+        """All output spent on hidden reasoning leaves no visible text; that
+        stays a failure (cooldown), never an empty summary."""
+        c = self._compressor()
+        empty = _summary_response("", "length")
+
+        with patch("agent.context_compressor.call_llm", return_value=empty) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 2
+        assert summary is None
+        assert c._summary_failure_cooldown_until > 0
+
+    def test_small_window_skips_retry_and_keeps_partial(self):
+        """When a quarter of the window is no bigger than the current cap there
+        is no room to retry; the partial is kept immediately."""
+        c = self._compressor(context_length=8000)
+        capped = _summary_response("## Active Task\npartial", "length")
+
+        with patch("agent.context_compressor.call_llm", return_value=capped) as mock_call:
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert mock_call.call_count == 1
+        assert "partial" in summary
+        assert "truncated" in summary.lower()
+
+    def test_retry_cap_bounded_by_smaller_summary_model_window(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="small-summarizer",
+                quiet_mode=True,
+            )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=16000):
+            assert c._expanded_summary_max_tokens(2600) == 16000 // 4
+
+    def test_truncation_note_does_not_stack_across_compactions(self):
+        c = self._compressor()
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_summary_response("## Active Task\npartial", "length"),
+        ):
+            c._generate_summary(_LENGTH_CAP_TURNS)
+        echoed = _summary_response(c._previous_summary + "\nmore", "length")
+        with patch("agent.context_compressor.call_llm", return_value=echoed):
+            summary = c._generate_summary(_LENGTH_CAP_TURNS)
+
+        assert summary.lower().count("summary truncated") == 1
+
+
+class TestSummaryFinishReason:
+    def test_object_shaped_response(self):
+        assert _summary_finish_reason(_summary_response("x", "length")) == "length"
+
+    def test_dict_shaped_response_and_choice(self):
+        assert _summary_finish_reason({"choices": [{"finish_reason": "length"}]}) == "length"
+
+    def test_case_insensitive(self):
+        assert _summary_finish_reason({"choices": [{"finish_reason": "LENGTH"}]}) == "length"
+
+    def test_unrecognised_shapes_return_none(self):
+        assert _summary_finish_reason(None) is None
+        assert _summary_finish_reason({"choices": []}) is None
+        assert _summary_finish_reason({"choices": [{}]}) is None
